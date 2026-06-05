@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from config import SSE_KEEPALIVE_TIMEOUT
-from dependencies import connected_clients
+from services.poller import connected_clients
 from logger import get_logger
 
 logger = get_logger(__name__)
