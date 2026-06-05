@@ -1,99 +1,105 @@
 """
-Order CRUD Routes
------------------
-FastAPI router for creating, reading, updating, and deleting orders.
-
-Dependency Inversion in action:
-  These routes depend on OrderRepository (the abstraction), NOT on
-  SqlServerOrderRepository (the detail). The concrete repo is injected
-  via FastAPI's dependency injection system (Depends).
-
-  To swap databases: change the factory in dependencies.py — zero edits here.
-
-All DB helpers are sync (pyodbc). They are wrapped in run_in_executor()
-so the event loop stays unblocked during I/O.
+routes/orders.py — CRUD endpoints for the orders table.
+Each operation triggers trg_orders_change automatically.
 """
 
-import asyncio
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from database import get_db_connection
 from models import OrderCreate, OrderStatusUpdate
-from repositories.base import OrderRepository
-from dependencies import get_order_repository
+from logger import get_logger
 
-router = APIRouter(prefix="/orders", tags=["orders"])
+logger = get_logger(__name__)
+router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
-# ---------------------------------------------------------------------------
-# GET /orders  — list all orders
-# ---------------------------------------------------------------------------
-
-@router.get("")
-async def get_orders(repo: OrderRepository = Depends(get_order_repository)):
-    """
-    Return all orders sorted by newest first.
-
-    The repo is injected by FastAPI — the route doesn't know (or care)
-    whether data comes from SQL Server, Postgres, or an in-memory store.
-    """
-    loop = asyncio.get_running_loop()
-    rows = await loop.run_in_executor(None, repo.get_all)
+@router.get("/")
+def get_orders():
+    """Return all orders, most recent first."""
+    logger.info("GET /orders — fetching all orders")
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, customer_name, product_name, status,
+               CONVERT(VARCHAR, updated_at, 126) AS updated_at
+        FROM orders
+        ORDER BY id DESC
+    """)
+    cols = [d[0] for d in cursor.description]
+    rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+    conn.close()
+    logger.info("Returned %d orders.", len(rows))
     return JSONResponse(content=rows)
 
 
-# ---------------------------------------------------------------------------
-# POST /orders  — create a new order
-# ---------------------------------------------------------------------------
+@router.post("/", status_code=201)
+def create_order(body: OrderCreate):
+    """INSERT a new order — fires the DB trigger → change_log → SSE."""
+    logger.info(
+        "POST /orders — Creating order: customer=%s product=%s status=%s",
+        body.customer_name, body.product_name, body.status,
+    )
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO orders (customer_name, product_name, status) VALUES (?, ?, ?)",
+            body.customer_name, body.product_name, body.status,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("Order created successfully for customer: %s", body.customer_name)
+        return {"message": "Order created successfully"}
+    except Exception as e:
+        logger.error("Failed to create order: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create order")
 
-@router.post("", status_code=201)
-async def create_order(
-    body: OrderCreate,
-    repo: OrderRepository = Depends(get_order_repository),
-):
-    """
-    Insert a new order.
-    The DB trigger fires automatically → writes to change_log → SSE poller picks up.
-
-    Body is validated by Pydantic (OrderCreate) before reaching this handler.
-    """
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, repo.insert, body)
-    return {"message": "Order created"}
-
-
-# ---------------------------------------------------------------------------
-# PATCH /orders/{order_id}  — update status
-# ---------------------------------------------------------------------------
 
 @router.patch("/{order_id}")
-async def update_order_status(
-    order_id: int,
-    body: OrderStatusUpdate,
-    repo: OrderRepository = Depends(get_order_repository),
-):
-    """
-    Change the status of an existing order.
-    Accepted values are enforced by the OrderStatusUpdate Pydantic model.
-    """
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, repo.update_status, order_id, body.status)
-    return {"message": "Order updated"}
+def update_order_status(order_id: int, body: OrderStatusUpdate):
+    """UPDATE order status — fires the DB trigger."""
+    logger.info("PATCH /orders/%d — Updating status to '%s'", order_id, body.status)
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE orders SET status = ?, updated_at = GETDATE() WHERE id = ?",
+            body.status, order_id,
+        )
+        if cursor.rowcount == 0:
+            conn.close()
+            logger.warning("Order #%d not found for update.", order_id)
+            raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        conn.commit()
+        conn.close()
+        logger.info("Order #%d updated to '%s'.", order_id, body.status)
+        return {"message": f"Order {order_id} updated to '{body.status}'"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to update order #%d: %s", order_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update order")
 
-
-# ---------------------------------------------------------------------------
-# DELETE /orders/{order_id}  — remove an order
-# ---------------------------------------------------------------------------
 
 @router.delete("/{order_id}")
-async def delete_order(
-    order_id: int,
-    repo: OrderRepository = Depends(get_order_repository),
-):
-    """
-    Hard-delete an order row.
-    The DB trigger writes the deleted snapshot to change_log before removal.
-    """
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, repo.delete, order_id)
-    return {"message": "Order deleted"}
+def delete_order(order_id: int):
+    """DELETE an order — fires the DB trigger."""
+    logger.info("DELETE /orders/%d", order_id)
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM orders WHERE id = ?", order_id)
+        if cursor.rowcount == 0:
+            conn.close()
+            logger.warning("Order #%d not found for deletion.", order_id)
+            raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        conn.commit()
+        conn.close()
+        logger.info("Order #%d deleted successfully.", order_id)
+        return {"message": f"Order {order_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to delete order #%d: %s", order_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete order")

@@ -1,87 +1,65 @@
 """
-SSE Stream Route
-----------------
-Manages the /stream endpoint and the /clients utility endpoint.
-
-The ChangeLogPoller is injected via FastAPI's dependency system.
-This route only handles:
-  - Registering / deregistering client queues with the poller
-  - Streaming SSE payloads from the queue to the HTTP response
-  - Sending keepalive pings to prevent proxy timeouts
-
-WHY inject the poller:
-  - Single Responsibility: the route doesn't own the poller lifecycle.
-  - Testability: swap in a mock poller during tests.
+routes/stream.py — Server-Sent Events (SSE) endpoint.
+Each browser tab that connects gets its own asyncio.Queue.
+The poller in services/poller.py pushes payloads into every queue.
 """
 
 import asyncio
-from fastapi import APIRouter, Request, Depends
+
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from services.poller import ChangeLogPoller
-from dependencies import get_poller
 from config import SSE_KEEPALIVE_TIMEOUT
+from dependencies import connected_clients
+from logger import get_logger
 
-router = APIRouter(tags=["stream"])
+logger = get_logger(__name__)
+router = APIRouter(tags=["Stream"])
 
-
-# ---------------------------------------------------------------------------
-# GET /stream  — SSE endpoint
-# ---------------------------------------------------------------------------
 
 @router.get("/stream")
-async def stream(
-    request: Request,
-    poller: ChangeLogPoller = Depends(get_poller),
-):
+async def stream(request: Request):
     """
-    Long-lived SSE connection.
-
-    Each connecting browser tab gets its own asyncio.Queue. The poller
-    puts JSON payloads into every queue; this generator yields them as
-    SSE-formatted strings.
-
-    Keepalive comments (": keepalive") are sent every SSE_KEEPALIVE_TIMEOUT
-    seconds to prevent reverse proxies from closing idle connections.
+    SSE endpoint — browser connects here and receives live DB change events.
+    Connection stays open until the browser tab is closed.
     """
     queue: asyncio.Queue = asyncio.Queue()
-    await poller.add_client(queue)
-    print(f"🟢 Client connected. Total: {poller.client_count}")
+    connected_clients.append(queue)
+    logger.info("Client connected. Total connected: %d", len(connected_clients))
 
     async def event_generator():
-        # Immediate handshake so the browser knows the connection is live
         yield 'data: {"type": "connected", "message": "Listening for order changes..."}\n\n'
         try:
             while True:
                 if await request.is_disconnected():
+                    logger.info("Client disconnected (request ended).")
                     break
                 try:
-                    # Block until a payload arrives or the keepalive timeout fires
-                    payload = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_TIMEOUT)
+                    payload = await asyncio.wait_for(
+                        queue.get(), timeout=SSE_KEEPALIVE_TIMEOUT
+                    )
+                    logger.info("Broadcasting event to client: %s", payload[:80])
                     yield f"data: {payload}\n\n"
                 except asyncio.TimeoutError:
-                    # SSE comment — keeps the TCP connection alive through proxies
                     yield ": keepalive\n\n"
         finally:
-            # Always deregister, whether the client disconnected cleanly or not
-            await poller.remove_client(queue)
-            print(f"🔴 Client disconnected. Total: {poller.client_count}")
+            if queue in connected_clients:
+                connected_clients.remove(queue)
+            logger.info("Client removed. Total connected: %d", len(connected_clients))
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",       # No intermediary caching of the stream
-            "X-Accel-Buffering": "no",         # Disable nginx buffering
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
         },
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /clients  — diagnostic utility
-# ---------------------------------------------------------------------------
-
 @router.get("/clients")
-async def active_clients(poller: ChangeLogPoller = Depends(get_poller)):
-    """Return the current number of connected SSE clients. Useful for monitoring."""
-    return {"connected_clients": poller.client_count}
+def active_clients():
+    """Utility endpoint — returns count of currently connected SSE clients."""
+    count = len(connected_clients)
+    logger.info("GET /clients — %d client(s) connected.", count)
+    return {"connected_clients": count}
